@@ -307,6 +307,36 @@ function scanForGameMarkers() {
     return found;
 }
 
+// Last resort: ST's own addOneMessage() has, in practice, sometimes added
+// the message to context.chat (or we pushed it directly ourselves) without
+// ever producing a corresponding .mes DOM element — confirmed by exporting
+// the actual chat.jsonl and seeing the data present while document had zero
+// matching elements. When scanning gives up, build a minimal-but-functional
+// message element ourselves instead of leaving the game permanently stuck.
+function manuallyRenderOrphanedGame(gameId) {
+    const context = getContext();
+    const entry = gameStore.get(gameId);
+    if (!entry || !entry.html) return;
+    const chatEl = document.getElementById("chat");
+    if (!chatEl) return;
+
+    console.warn("[AI Minigames] ST never produced a .mes element for game", gameId, "— building a minimal fallback element directly so the game isn't stranded.");
+
+    const idx = Array.isArray(context.chat) ? context.chat.findIndex((m) => m?.extra?.aimg_game === gameId) : -1;
+
+    const mesEl = document.createElement("div");
+    mesEl.className = "mes aimg-manual-mes";
+    if (idx !== -1) mesEl.setAttribute("mesid", String(idx));
+    mesEl.innerHTML = `
+        <div class="aimg-manual-header">🎮 Minigame ready — loading below…</div>
+        <div class="mes_block"><div class="mes_text"></div></div>
+    `;
+    chatEl.appendChild(mesEl);
+    mesEl.scrollIntoView({ behavior: "smooth", block: "end" });
+
+    injectIframeIntoMessage(mesEl, gameId, idx !== -1 ? context.chat[idx] : null);
+}
+
 // addOneMessage's DOM/array update can lag behind the call returning (seen
 // as ST's own "Timeout waiting for chat to save" on large chats), so a
 // single immediate scan can miss the message. Retry a few times on a short
@@ -328,7 +358,7 @@ function scanForGameMarkersWithRetry(gameId, attemptsLeft = 6) {
                 gameStoreHasEntry: !!entry,
             },
         );
-        toastr?.warning?.("AI Minigames: posted the message but couldn't find it to attach the game. Check console diagnostics.");
+        manuallyRenderOrphanedGame(gameId);
         return;
     }
     setTimeout(() => scanForGameMarkersWithRetry(gameId, attemptsLeft - 1), 300);
