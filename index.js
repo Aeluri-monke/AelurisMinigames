@@ -511,7 +511,7 @@ function toolCallingReady() {
 const TOOL_NUDGE_KEY = "ai_minigames_tool_nudge";
 
 function toolNudgePrompt(description) {
-    return `[SYSTEM: The user has requested an embedded minigame via /minigame. In this reply, call the ${TOOL_NAME} tool with a complete, working self-contained HTML/CSS/JS minigame matching this request: "${description}". You may narrate normally alongside it, but you MUST actually call the tool — describing the game in prose instead of calling it does not satisfy this request.]`;
+    return `[SYSTEM: The user has requested an embedded minigame via /minigame. In this reply, call the ${TOOL_NAME} tool with a complete, working self-contained HTML/CSS/JS minigame matching this request: "${description}". You MUST actually call the tool — describing the game in prose instead of calling it does not satisfy this request. IMPORTANT: you do not know how the minigame turns out yet — the human has to actually play it after this turn, which takes real time you cannot see. Do NOT narrate, guess, or continue the scene's outcome after calling the tool. A short line acknowledging the game is loading is fine (e.g. "the game loads in front of you"), but then stop — do not describe what happens in the game, whether it succeeds or fails, or what comes next. The actual outcome will be given to you as a system message once the human finishes playing, on a later turn — that is when you continue the scene, not now.]`;
 }
 
 // ---------------------------------------------------------------------------
