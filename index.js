@@ -43,10 +43,11 @@ function getSettings() {
 const GAME_CONTRACT_PROMPT = (description) => `
 SYSTEM OVERRIDE — this is a code-generation task, not a roleplay turn. Ignore
 the ongoing scene, the character's voice, and any narrative continuation
-entirely. Do not write ANY prose, narration, or in-character text before,
-during, or after your answer — not even a sentence of scene-setting. Your
-entire response must be nothing but the code block below. Starting with
-narrative text instead of the code block is a failure.
+entirely. Do not write ANY prose, narration, in-character text, info boards,
+timestamp/weather headers, or scene-setting formatting before, during, or
+after your answer — not even one line of it. Your entire response must be
+nothing but the code block below. Starting with anything other than the code
+fence is a failure.
 
 You are generating a tiny, self-contained browser minigame to be embedded in a
 roleplay chat as an <iframe>. Output ONLY one HTML code block, nothing else —
@@ -89,7 +90,13 @@ function extractHtml(text) {
     // This is a known, common failure mode when models wrap HTML/JS in fences
     // (see e.g. the SillyTavern-WeatherPack extension, whose job is literally
     // un-mangling HTML/JS that got clipped by backtick fences).
-    const docMatch = text.match(/<!DOCTYPE[\s\S]*?<\/html>/i) || text.match(/<html[\s\S]*?<\/html>/i);
+    // Greedy match to the LAST </html>, not lazy-to-the-first. A lazy match
+    // stops at whatever looks like a closing tag soonest — which breaks badly
+    // if the model's own JS/text contains an early "</html>"-shaped string
+    // (e.g. a stray example, an escaped snippet) before the real document end.
+    // Greedy-to-last is the safer default: a genuine single document only has
+    // one real closing tag, and any decoys sit earlier in the text.
+    const docMatch = text.match(/<!DOCTYPE[\s\S]*<\/html>/i) || text.match(/<html[\s\S]*<\/html>/i);
     if (docMatch) return docMatch[0].trim();
 
     // Fallback: fence-based extraction, only if there's no </html> to anchor on
