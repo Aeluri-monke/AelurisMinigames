@@ -44,10 +44,12 @@ const GAME_CONTRACT_PROMPT = (description) => `
 SYSTEM OVERRIDE — this is a code-generation task, not a roleplay turn. Ignore
 the ongoing scene, the character's voice, and any narrative continuation
 entirely. Do not write ANY prose, narration, in-character text, info boards,
-timestamp/weather headers, or scene-setting formatting before, during, or
-after your answer — not even one line of it. Your entire response must be
-nothing but the code block below. Starting with anything other than the code
-fence is a failure.
+timestamp/weather headers, status cards, or scene-setting formatting before,
+during, or after your answer — not even one line of it, not even a fenced
+block labeled "mb" or anything else. Your entire response must be nothing but
+the code block below and absolutely nothing else. If you notice yourself
+starting to write a story, a scene, or a character voice, stop and discard
+it — that is not what this task is.
 
 You are generating a tiny, self-contained browser minigame to be embedded in a
 roleplay chat as an <iframe>. Output ONLY one HTML code block, nothing else —
@@ -91,35 +93,24 @@ function extractHtml(text) {
 
     // Fence-based: greedy to the LAST closing fence, in case the model
     // properly wrapped the whole thing in one ```html ... ``` block.
-    const fenceMatch = text.match(/```html\s*([\s\S]*)```/i) || text.match(/```\s*([\s\S]*)```/);
+    const fenceMatch = text.match(/```html\s*([\s\S]*)```/i);
     if (fenceMatch) candidates.push(fenceMatch[1].trim());
+    // A generic, unlabeled ``` fence is deliberately NOT tried as a fallback
+    // here — a roleplay response can easily contain some other unrelated
+    // fenced block (a status card, a time/weather readout, etc.), and a
+    // short unrelated fence being mistaken for "the game" is worse than
+    // just failing loudly and asking the model to try again.
 
-    // Neither extraction method is reliable alone — a model can dump real
-    // page content AFTER a stray/decoy "</html>"-shaped string, which makes
-    // even a greedy structural match latch onto the wrong (short) span. So
-    // score candidates instead of trusting the first one: a real game always
-    // has a <script> tag, and between valid candidates the longer one is more
-    // likely to be the complete document rather than a truncated fragment.
+    // A real game always has a <script> tag. If nothing we found has one,
+    // this wasn't a game at all — likely the model ignored the contract and
+    // wrote roleplay/narrative text instead. Don't settle for a plausible-
+    // looking fragment; refuse so the caller can retry instead of posting
+    // broken or unrelated content into the chat.
     const withScript = candidates.filter((c) => /<script/i.test(c));
-    const pool = withScript.length ? withScript : candidates;
-    if (pool.length) {
-        pool.sort((a, b) => b.length - a.length);
-        const chosen = pool[0];
-        if (chosen.length < text.length * 0.3) {
-            console.warn(
-                "[AI Minigames] extracted HTML is suspiciously short relative to the raw response " +
-                `(${chosen.length}/${text.length} chars). Raw response follows for debugging:`,
-                text,
-            );
-        }
-        return chosen;
-    }
+    if (!withScript.length) return null;
 
-    // Last resort: raw text that looks like markup with no fences/tags matched at all.
-    if (text.includes("<html") || text.includes("<!DOCTYPE") || text.includes("<style") || text.includes("<script")) {
-        return text.trim();
-    }
-    return null;
+    withScript.sort((a, b) => b.length - a.length);
+    return withScript[0];
 }
 
 // Wrap the model's HTML so we can intercept onGameComplete via postMessage
@@ -346,21 +337,39 @@ async function requestMinigame(description) {
     toastr?.info?.("Asking the AI to build your minigame…");
     let raw;
     try {
-        // Prefer the object-form call — ST logs a deprecation warning for the
-        // old positional (prompt, quietToLoud, skipWIAN) signature and may drop
-        // it entirely in a future version.
-        raw = await context.generateQuietPrompt({
-            quietPrompt: GAME_CONTRACT_PROMPT(description),
-            quietToLoud: false,
-            skipWIAN: true,
-        });
+        if (typeof context.generateRaw === "function") {
+            console.log("[AI Minigames] using generateRaw for isolation.");
+            try {
+                raw = await context.generateRaw({
+                    prompt: GAME_CONTRACT_PROMPT(description),
+                    systemPrompt: GAME_CONTRACT_PROMPT(description),
+                });
+            } catch (rawError) {
+                console.warn("[AI Minigames] generateRaw threw, falling back to generateQuietPrompt:", rawError);
+                raw = null;
+            }
+            if (!raw) {
+                raw = await context.generateQuietPrompt({
+                    quietPrompt: GAME_CONTRACT_PROMPT(description),
+                    quietToLoud: false,
+                    skipWIAN: true,
+                });
+            }
+        } else {
+            console.log("[AI Minigames] generateRaw unavailable — falling back to generateQuietPrompt (full chat context included).");
+            raw = await context.generateQuietPrompt({
+                quietPrompt: GAME_CONTRACT_PROMPT(description),
+                quietToLoud: false,
+                skipWIAN: true,
+            });
+        }
     } catch (e) {
         console.error("[AI Minigames] generation call threw:", e);
         toastr?.error?.("AI Minigames: generation failed. Check console.");
         return;
     }
 
-    // generateQuietPrompt's return shape isn't 100% consistent across ST versions —
+    // generateQuietPrompt/generateRaw's return shape isn't 100% consistent across ST versions —
     // coerce defensively instead of assuming it's always a plain string.
     if (raw && typeof raw === "object") {
         raw = raw.text ?? raw.message ?? raw.content ?? JSON.stringify(raw);
@@ -369,8 +378,8 @@ async function requestMinigame(description) {
 
     const html = extractHtml(String(raw ?? ""));
     if (!html) {
-        toastr?.error?.("AI Minigames: the model didn't return usable HTML. Try again or rephrase. See console for the raw response.");
-        console.warn("[AI Minigames] extraction failed. Raw response was:", raw);
+        toastr?.error?.("AI Minigames: the model responded with roleplay/text instead of a working game. Try again — see console for the raw response.");
+        console.warn("[AI Minigames] no valid game HTML found. Raw response:", raw);
         return;
     }
 
