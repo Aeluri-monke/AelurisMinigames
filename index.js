@@ -179,20 +179,9 @@ async function postMinigameMessage(html) {
 
     try {
         context.addOneMessage(messageObj);
-        if (Array.isArray(context.chat)) {
-            const idx = context.chat.length - 1;
-            // Make sure extra survived onto the actual chat array entry (some
-            // ST versions may not carry a caller-provided "extra" through
-            // addOneMessage verbatim, so set it directly as a fallback too).
-            if (context.chat[idx] && !context.chat[idx].extra) {
-                context.chat[idx].extra = { aimg_game: gameId };
-            } else if (context.chat[idx] && !context.chat[idx].extra?.aimg_game) {
-                context.chat[idx].extra.aimg_game = gameId;
-            }
-        }
         if (typeof context.saveChat === "function") context.saveChat();
         console.log("[AI Minigames] posted message for game", gameId, "— waiting for #chat to render it.");
-        scanForGameMarkers(); // in case the observer's mutation already fired before we got here
+        scanForGameMarkersWithRetry(gameId);
     } catch (e) {
         console.error("[AI Minigames] addOneMessage threw:", e);
         toastr?.error?.("AI Minigames: failed to post the minigame message. Check console.");
@@ -245,13 +234,45 @@ function injectIframeIntoMessage(mesEl, gameId) {
 
 function scanForGameMarkers() {
     const context = getContext();
+    let found = 0;
     document.querySelectorAll("#chat .mes").forEach((mesEl) => {
         const mesId = mesEl.getAttribute("mesid");
         if (mesId === null) return;
         const chatEntry = context.chat?.[Number(mesId)];
         const gameId = chatEntry?.extra?.aimg_game;
-        if (gameId) injectIframeIntoMessage(mesEl, gameId);
+        if (gameId) {
+            found += 1;
+            injectIframeIntoMessage(mesEl, gameId);
+        }
     });
+    return found;
+}
+
+// addOneMessage's DOM/array update can lag behind the call returning (seen
+// as ST's own "Timeout waiting for chat to save" on large chats), so a
+// single immediate scan can miss the message. Retry a few times on a short
+// delay, and if it's STILL not found, dump diagnostics instead of failing
+// silently — this is exactly the kind of thing that otherwise needs another
+// screenshot round-trip to debug.
+function scanForGameMarkersWithRetry(gameId, attemptsLeft = 6) {
+    const found = scanForGameMarkers();
+    const entry = gameStore.get(gameId);
+    const alreadyInjected = document.querySelector(`[data-aimg-game="${gameId}"]`);
+    if (found > 0 || alreadyInjected) return;
+    if (attemptsLeft <= 0) {
+        const context = getContext();
+        console.warn(
+            "[AI Minigames] gave up looking for game", gameId, "after retries. Diagnostics:",
+            {
+                mesElementCount: document.querySelectorAll("#chat .mes").length,
+                lastChatEntries: Array.isArray(context.chat) ? context.chat.slice(-3) : context.chat,
+                gameStoreHasEntry: !!entry,
+            },
+        );
+        toastr?.warning?.("AI Minigames: posted the message but couldn't find it to attach the game. Check console diagnostics.");
+        return;
+    }
+    setTimeout(() => scanForGameMarkersWithRetry(gameId, attemptsLeft - 1), 300);
 }
 
 // Watch for #chat re-renders (new messages, swipes, chat load) and re-inject
