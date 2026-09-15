@@ -170,12 +170,31 @@ async function postMinigameMessage(html) {
         // but this object gets saved into the persisted chat JSON — so a
         // reload can still recover and re-render the game from the message
         // itself instead of the marker becoming permanently orphaned.
-        extra: { aimg_game: gameId, aimg_html: html },
+        extra: { aimg_game: gameId, aimg_html: html, isSmallSys: true },
     };
 
     try {
         context.addOneMessage(messageObj);
-        if (typeof context.saveChat === "function") context.saveChat();
+
+        // addOneMessage has, in practice, rendered this transiently in the
+        // UI without ever actually landing it in the persisted context.chat
+        // array (confirmed by exporting a chat.jsonl where the message was
+        // simply absent). Verify it actually landed; if not, retry once,
+        // and fall back to pushing directly onto the array as a last resort
+        // so the game is at least recoverable even if the DOM doesn't
+        // reflect it until the next full chat re-render.
+        let landed = Array.isArray(context.chat) && context.chat.some((m) => m?.extra?.aimg_game === gameId);
+        if (!landed) {
+            console.warn("[AI Minigames] message didn't land in context.chat after addOneMessage — retrying once.");
+            context.addOneMessage(messageObj);
+            landed = Array.isArray(context.chat) && context.chat.some((m) => m?.extra?.aimg_game === gameId);
+        }
+        if (!landed && Array.isArray(context.chat)) {
+            console.error("[AI Minigames] addOneMessage still didn't persist the message after retry — pushing directly onto context.chat as a last resort.");
+            context.chat.push(messageObj);
+        }
+
+        if (typeof context.saveChat === "function") await context.saveChat();
         console.log("[AI Minigames] posted message for game", gameId, "— waiting for #chat to render it.");
         scanForGameMarkersWithRetry(gameId);
     } catch (e) {
@@ -213,7 +232,14 @@ function injectIframeIntoMessage(mesEl, gameId, chatEntry) {
         return;
     }
 
-    const host = mesEl.querySelector(".mes_text") || mesEl;
+    // Append to .mes_block (the outer container holding .mes_text, edit
+    // controls, etc.) rather than INSIDE .mes_text itself. ST re-parses
+    // .mes_text's innerHTML from the raw message text through its markdown/
+    // syntax-highlight pipeline (visible as those "Could not find the
+    // language 'mb'" warnings in the console) — anything we'd appended
+    // inside .mes_text is a casualty of that regeneration. Living as a
+    // sibling of .mes_text instead means that reprocessing can't touch us.
+    const host = mesEl.querySelector(".mes_block") || mesEl;
 
     const frameId = `aimg-frame-${gameId}`;
     const wrapper = document.createElement("div");
@@ -231,7 +257,7 @@ function injectIframeIntoMessage(mesEl, gameId, chatEntry) {
 
     const iframe = wrapper.querySelector(`#${frameId}`);
     iframe.srcdoc = wrapGameHtml(entry.html);
-    console.log("[AI Minigames] injected iframe for game", gameId);
+    console.log("[AI Minigames] injected iframe for game", gameId, "into host:", host === mesEl ? "mesEl (fallback)" : ".mes_block");
 
     if (entry.result) return; // already finished (re-render case) — no need to re-listen
 
