@@ -325,9 +325,87 @@ async function handleGameResult(result, gameId) {
 }
 
 // ---------------------------------------------------------------------------
+// Function-tool registration — the real fix. Instead of asking the model to
+// output a fenced code block in free text (which roleplay narrative, decoy
+// tags, and fence-breakout backticks have all broken in different ways
+// tonight), register a proper JSON-schema tool. When the model calls it,
+// the html arrives as a clean, structured argument — no text-mining at all.
+// Per ST's docs, tool calls only fire on NORMAL generations, never on
+// "quiet"/background ones, so this only works by nudging the model during
+// an actual visible turn (see queueMinigameToolRequest below).
+// ---------------------------------------------------------------------------
+const TOOL_NAME = "submit_minigame";
+let toolRegistered = false;
+
+function minigameToolDescription() {
+    return "Submit a self-contained HTML/CSS/JS minigame to be embedded in the roleplay chat as an interactive game. Call this whenever the user has requested a minigame (e.g. via /minigame) or the scene calls for one. The html argument must be a single complete HTML document with all CSS in a <style> tag and all JS in a <script> tag, no external resources. The game's own script must call window.onGameComplete({outcome, summary, details}) exactly once when it ends — that function is injected automatically by the host, do not define it yourself.";
+}
+
+function minigameToolParameters() {
+    return {
+        $schema: "http://json-schema.org/draft-04/schema#",
+        type: "object",
+        properties: {
+            html: {
+                type: "string",
+                description: "A complete, self-contained HTML document (<!DOCTYPE html>, <html>, <head><style>...</style></head>, <body>...<script>...</script></body>) implementing the requested minigame. No localStorage/sessionStorage/cookies, no external resources. Its script must call window.onGameComplete({outcome, summary, details}) exactly once when the game ends.",
+            },
+        },
+        required: ["html"],
+    };
+}
+
+function registerMinigameTool() {
+    try {
+        const context = getContext();
+        if (typeof context.registerFunctionTool !== "function") {
+            console.warn("[AI Minigames] registerFunctionTool unavailable — tool-calling path disabled, text-extraction fallback only.");
+            return;
+        }
+        context.registerFunctionTool({
+            name: TOOL_NAME,
+            displayName: "Submit Minigame",
+            description: minigameToolDescription(),
+            parameters: minigameToolParameters(),
+            action: async ({ html }) => {
+                console.log("[AI Minigames] tool call received, html length:", html?.length ?? 0);
+                if (!html || !/<script/i.test(html)) {
+                    console.warn("[AI Minigames] tool call html missing a <script> tag — rejecting.");
+                    return "Error: html must be a complete document containing a <script> tag with the game logic. Please retry the tool call with valid html.";
+                }
+                await postMinigameMessage(html);
+                return "Minigame embedded in chat successfully.";
+            },
+        });
+        toolRegistered = true;
+        console.log("[AI Minigames] submit_minigame function tool registered.");
+    } catch (e) {
+        console.warn("[AI Minigames] registerFunctionTool threw:", e);
+    }
+}
+
+function toolCallingReady() {
+    if (!toolRegistered) return false;
+    try {
+        const context = getContext();
+        if (typeof context.isToolCallingSupported === "function" && !context.isToolCallingSupported()) return false;
+        if (typeof context.canPerformToolCalls === "function" && !context.canPerformToolCalls("normal")) return false;
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+const TOOL_NUDGE_KEY = "ai_minigames_tool_nudge";
+
+function toolNudgePrompt(description) {
+    return `[SYSTEM: The user has requested an embedded minigame via /minigame. In this reply, call the ${TOOL_NAME} tool with a complete, working self-contained HTML/CSS/JS minigame matching this request: "${description}". You may narrate normally alongside it, but you MUST actually call the tool — describing the game in prose instead of calling it does not satisfy this request.]`;
+}
+
+// ---------------------------------------------------------------------------
 // Requesting a minigame from the connected API.
 // ---------------------------------------------------------------------------
-async function requestMinigame(description) {
+async function requestMinigame(description, { triggerGeneration } = {}) {
     if (!description || !description.trim()) {
         toastr?.warning?.("Describe the minigame you want first, e.g. /minigame a lockpicking puzzle");
         return;
@@ -337,9 +415,30 @@ async function requestMinigame(description) {
     settings.lastGameDescription = description;
     saveSettingsDebounced();
 
-    if (typeof context.generateQuietPrompt !== "function") {
-        console.error("[AI Minigames] context.generateQuietPrompt is not a function. Available context keys:", Object.keys(context));
-        toastr?.error?.("AI Minigames: this ST version doesn't expose generateQuietPrompt — can't request a game.");
+    if (toolCallingReady() && typeof context.setExtensionPrompt === "function") {
+        console.log("[AI Minigames] using function-tool path for this request.");
+        context.setExtensionPrompt(TOOL_NUDGE_KEY, toolNudgePrompt(description), 1, 0, false);
+        toastr?.info?.("Asking the AI to build your minigame…");
+        if (triggerGeneration && typeof context.generate === "function") {
+            // Only the settings-drawer button needs this: a slash command is
+            // already running inside ST's own normal Generate call, which
+            // will naturally pick up the nudge right after the command
+            // finishes — calling generate() again there would be re-entrant.
+            try {
+                await context.generate();
+            } catch (e) {
+                console.warn("[AI Minigames] context.generate() threw:", e);
+            }
+        } else if (triggerGeneration) {
+            toastr?.info?.("Now send any message to let the AI build the game.");
+        }
+        return;
+    }
+
+    console.log("[AI Minigames] tool-calling unavailable — falling back to text-extraction path.");
+    if (typeof context.generateQuietPrompt !== "function" && typeof context.generateRaw !== "function") {
+        console.error("[AI Minigames] neither generateRaw nor generateQuietPrompt available. Context keys:", Object.keys(context));
+        toastr?.error?.("AI Minigames: this ST version doesn't expose a generation API this extension can use.");
         return;
     }
 
@@ -461,7 +560,7 @@ function addExtensionSettings(settings) {
     });
     content.querySelector("#aimg_generate_btn").addEventListener("click", () => {
         const desc = content.querySelector("#aimg_description").value;
-        requestMinigame(desc);
+        requestMinigame(desc, { triggerGeneration: true });
     });
 }
 
@@ -476,7 +575,7 @@ function tryRegisterSlashCommand() {
             context.registerSlashCommand(
                 "minigame",
                 (_args, description) => {
-                    requestMinigame(description);
+                    requestMinigame(description, { triggerGeneration: false });
                     return "";
                 },
                 [],
@@ -499,6 +598,7 @@ jQuery(() => {
         const settings = getSettings();
         addExtensionSettings(settings);
         tryRegisterSlashCommand();
+        registerMinigameTool();
 
         eventSource.on(event_types.CHAT_CHANGED, () => {
             // Clear any pending hidden injection when the chat changes.
@@ -506,6 +606,18 @@ jQuery(() => {
                 const context = getContext();
                 if (typeof context.setExtensionPrompt === "function") {
                     context.setExtensionPrompt(EXT_PROMPT_KEY, "", 1, 0, false);
+                    context.setExtensionPrompt(TOOL_NUDGE_KEY, "", 1, 0, false);
+                }
+            } catch {}
+        });
+
+        eventSource.on(event_types.GENERATION_ENDED, () => {
+            // The tool nudge is one-shot — clear it after every generation so
+            // it doesn't bleed into unrelated future turns.
+            try {
+                const context = getContext();
+                if (typeof context.setExtensionPrompt === "function") {
+                    context.setExtensionPrompt(TOOL_NUDGE_KEY, "", 1, 0, false);
                 }
             } catch {}
         });
