@@ -180,9 +180,14 @@ async function postMinigameMessage(html) {
 }
 
 function injectIframeIntoMessage(mesEl, gameId) {
-    if (mesEl.querySelector(`[data-aimg-game="${gameId}"]`)) return; // already injected, don't duplicate
+    if (mesEl.querySelector(`[data-aimg-game="${gameId}"]`)) {
+        return; // already injected — this one's fine to stay silent, it's the normal re-render case
+    }
     const entry = gameStore.get(gameId);
-    if (!entry || !entry.html) return;
+    if (!entry || !entry.html) {
+        console.warn("[AI Minigames] injectIframeIntoMessage: no stored entry/html for game", gameId, "— gameStore has keys:", Array.from(gameStore.keys()));
+        return;
+    }
 
     const host = mesEl.querySelector(".mes_text") || mesEl;
 
@@ -226,16 +231,21 @@ function injectIframeIntoMessage(mesEl, gameId) {
 function scanForGameMarkers() {
     const context = getContext();
     let found = 0;
+    let mesElCount = 0;
+    let markedCount = 0;
     document.querySelectorAll("#chat .mes").forEach((mesEl) => {
+        mesElCount += 1;
         const mesId = mesEl.getAttribute("mesid");
         if (mesId === null) return;
         const chatEntry = context.chat?.[Number(mesId)];
         const gameId = chatEntry?.extra?.aimg_game;
         if (gameId) {
+            markedCount += 1;
             found += 1;
             injectIframeIntoMessage(mesEl, gameId);
         }
     });
+    console.log(`[AI Minigames] scanForGameMarkers: scanned ${mesElCount} .mes elements, ${markedCount} carried an aimg_game marker.`);
     return found;
 }
 
