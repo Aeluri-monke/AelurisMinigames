@@ -83,28 +83,39 @@ Begin your response immediately with \`\`\`html — no text before it.
 function extractHtml(text) {
     if (!text) return null;
 
-    // Prefer structural extraction (DOCTYPE/<html>...</html>) over fence-matching.
-    // Generated game JS very often contains template literals with backticks
-    // (e.g. `Score: ${score}`), and a naive ``` ... ``` regex closes early on
-    // the first stray backtick sequence inside the code, truncating the game.
-    // This is a known, common failure mode when models wrap HTML/JS in fences
-    // (see e.g. the SillyTavern-WeatherPack extension, whose job is literally
-    // un-mangling HTML/JS that got clipped by backtick fences).
-    // Greedy match to the LAST </html>, not lazy-to-the-first. A lazy match
-    // stops at whatever looks like a closing tag soonest — which breaks badly
-    // if the model's own JS/text contains an early "</html>"-shaped string
-    // (e.g. a stray example, an escaped snippet) before the real document end.
-    // Greedy-to-last is the safer default: a genuine single document only has
-    // one real closing tag, and any decoys sit earlier in the text.
+    const candidates = [];
+
+    // Structural: greedy from <!DOCTYPE or <html to the LAST </html>.
     const docMatch = text.match(/<!DOCTYPE[\s\S]*<\/html>/i) || text.match(/<html[\s\S]*<\/html>/i);
-    if (docMatch) return docMatch[0].trim();
+    if (docMatch) candidates.push(docMatch[0].trim());
 
-    // Fallback: fence-based extraction, only if there's no </html> to anchor on
-    // (e.g. the model omitted <html> tags entirely and just gave <style>/<script>).
-    const fenced = text.match(/```html\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
-    if (fenced) return fenced[1].trim();
+    // Fence-based: greedy to the LAST closing fence, in case the model
+    // properly wrapped the whole thing in one ```html ... ``` block.
+    const fenceMatch = text.match(/```html\s*([\s\S]*)```/i) || text.match(/```\s*([\s\S]*)```/);
+    if (fenceMatch) candidates.push(fenceMatch[1].trim());
 
-    // Last resort: raw text that looks like markup with no fences at all.
+    // Neither extraction method is reliable alone — a model can dump real
+    // page content AFTER a stray/decoy "</html>"-shaped string, which makes
+    // even a greedy structural match latch onto the wrong (short) span. So
+    // score candidates instead of trusting the first one: a real game always
+    // has a <script> tag, and between valid candidates the longer one is more
+    // likely to be the complete document rather than a truncated fragment.
+    const withScript = candidates.filter((c) => /<script/i.test(c));
+    const pool = withScript.length ? withScript : candidates;
+    if (pool.length) {
+        pool.sort((a, b) => b.length - a.length);
+        const chosen = pool[0];
+        if (chosen.length < text.length * 0.3) {
+            console.warn(
+                "[AI Minigames] extracted HTML is suspiciously short relative to the raw response " +
+                `(${chosen.length}/${text.length} chars). Raw response follows for debugging:`,
+                text,
+            );
+        }
+        return chosen;
+    }
+
+    // Last resort: raw text that looks like markup with no fences/tags matched at all.
     if (text.includes("<html") || text.includes("<!DOCTYPE") || text.includes("<style") || text.includes("<script")) {
         return text.trim();
     }
