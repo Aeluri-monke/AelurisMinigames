@@ -41,9 +41,16 @@ function getSettings() {
 // state, we just wait for one call to window.onGameComplete(result).
 // ---------------------------------------------------------------------------
 const GAME_CONTRACT_PROMPT = (description) => `
+SYSTEM OVERRIDE — this is a code-generation task, not a roleplay turn. Ignore
+the ongoing scene, the character's voice, and any narrative continuation
+entirely. Do not write ANY prose, narration, or in-character text before,
+during, or after your answer — not even a sentence of scene-setting. Your
+entire response must be nothing but the code block below. Starting with
+narrative text instead of the code block is a failure.
+
 You are generating a tiny, self-contained browser minigame to be embedded in a
 roleplay chat as an <iframe>. Output ONLY one HTML code block, nothing else —
-no commentary before or after.
+no commentary before or after, no story text, no character dialogue.
 
 Requirements (all mandatory):
 1. The document must be a single, complete, self-contained HTML file: all CSS
@@ -59,18 +66,41 @@ Requirements (all mandatory):
      });
    This function is injected by the host page — do not define it yourself, just
    call it exactly once when the game ends.
-4. Keep the game simple enough to render and finish in under a couple minutes.
-   Clear on-screen instructions. Legible on a dark background — use light text.
-5. Do not use localStorage, sessionStorage, or cookies.
+4. Keep the game SHORT and token-efficient: minimal CSS, compact JS, no
+   decorative flourishes. This has to fit in one response alongside your
+   token budget — prioritize a working, finishable game over a polished one.
+5. Clear on-screen instructions. Legible on a dark background — use light text.
+6. Do not use localStorage, sessionStorage, or cookies.
+7. Avoid JS template literals (backtick strings) anywhere in your script — use
+   string concatenation or .join() instead. This is important: your output will
+   be extracted from a fenced code block, and a stray backtick inside your own
+   JS can break that extraction.
 
-Output the HTML now, in a single \`\`\`html code block.
+Begin your response immediately with \`\`\`html — no text before it.
 `.trim();
 
 function extractHtml(text) {
-    const match = text.match(/```html\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
-    if (match) return match[1].trim();
-    // fallback: maybe the model just returned raw HTML with no fence
-    if (text.includes("<html") || text.includes("<!DOCTYPE")) return text.trim();
+    if (!text) return null;
+
+    // Prefer structural extraction (DOCTYPE/<html>...</html>) over fence-matching.
+    // Generated game JS very often contains template literals with backticks
+    // (e.g. `Score: ${score}`), and a naive ``` ... ``` regex closes early on
+    // the first stray backtick sequence inside the code, truncating the game.
+    // This is a known, common failure mode when models wrap HTML/JS in fences
+    // (see e.g. the SillyTavern-WeatherPack extension, whose job is literally
+    // un-mangling HTML/JS that got clipped by backtick fences).
+    const docMatch = text.match(/<!DOCTYPE[\s\S]*?<\/html>/i) || text.match(/<html[\s\S]*?<\/html>/i);
+    if (docMatch) return docMatch[0].trim();
+
+    // Fallback: fence-based extraction, only if there's no </html> to anchor on
+    // (e.g. the model omitted <html> tags entirely and just gave <style>/<script>).
+    const fenced = text.match(/```html\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
+    if (fenced) return fenced[1].trim();
+
+    // Last resort: raw text that looks like markup with no fences at all.
+    if (text.includes("<html") || text.includes("<!DOCTYPE") || text.includes("<style") || text.includes("<script")) {
+        return text.trim();
+    }
     return null;
 }
 
@@ -96,32 +126,87 @@ function wrapGameHtml(rawHtml) {
 }
 
 let gameCounter = 0;
+// Generated HTML is kept here, keyed by game id, and re-injected into its
+// message's DOM every time #chat re-renders (which ST does often — on any
+// new message, edit, or swipe, it rebuilds #chat from the message array).
+// Anything appended as a loose sibling in #chat, not tied to a real message,
+// gets wiped the instant that happens. Attaching to a real message + a
+// MutationObserver survives that.
+const gameStore = new Map(); // gameId -> { html, result }
 
-function renderGameIntoChat(html) {
+function makeGameId() {
+    gameCounter += 1;
+    return `aimg_${Date.now()}_${gameCounter}`;
+}
+
+async function postMinigameMessage(html) {
     const context = getContext();
-    const chatEl = document.getElementById("chat");
-    if (!chatEl) {
-        toastr?.error?.("AI Minigames: couldn't find #chat to render into.");
+    const gameId = makeGameId();
+    gameStore.set(gameId, { html, result: null });
+
+    if (typeof context.addOneMessage !== "function") {
+        toastr?.error?.("AI Minigames: context.addOneMessage unavailable — can't post the game as a message.");
+        console.error("[AI Minigames] no addOneMessage on context. Available keys:", Object.keys(context));
         return;
     }
 
-    gameCounter += 1;
-    const frameId = `ai-minigame-frame-${gameCounter}`;
+    const messageObj = {
+        name: "System",
+        is_system: true,
+        is_user: false,
+        mes: "🎮 Minigame ready — loading below…",
+        send_date: Date.now(),
+        extra: { aimg_game: gameId },
+    };
 
+    try {
+        context.addOneMessage(messageObj);
+        if (Array.isArray(context.chat)) {
+            const idx = context.chat.length - 1;
+            // Make sure extra survived onto the actual chat array entry (some
+            // ST versions may not carry a caller-provided "extra" through
+            // addOneMessage verbatim, so set it directly as a fallback too).
+            if (context.chat[idx] && !context.chat[idx].extra) {
+                context.chat[idx].extra = { aimg_game: gameId };
+            } else if (context.chat[idx] && !context.chat[idx].extra?.aimg_game) {
+                context.chat[idx].extra.aimg_game = gameId;
+            }
+        }
+        if (typeof context.saveChat === "function") context.saveChat();
+        console.log("[AI Minigames] posted message for game", gameId, "— waiting for #chat to render it.");
+        scanForGameMarkers(); // in case the observer's mutation already fired before we got here
+    } catch (e) {
+        console.error("[AI Minigames] addOneMessage threw:", e);
+        toastr?.error?.("AI Minigames: failed to post the minigame message. Check console.");
+    }
+}
+
+function injectIframeIntoMessage(mesEl, gameId) {
+    if (mesEl.querySelector(`[data-aimg-game="${gameId}"]`)) return; // already injected, don't duplicate
+    const entry = gameStore.get(gameId);
+    if (!entry || !entry.html) return;
+
+    const host = mesEl.querySelector(".mes_text") || mesEl;
+
+    const frameId = `aimg-frame-${gameId}`;
     const wrapper = document.createElement("div");
     wrapper.className = "aimg-wrapper";
+    wrapper.dataset.aimgGame = gameId;
     wrapper.innerHTML = `
         <div class="aimg-header">
             <span class="aimg-tag">🎮 Minigame</span>
-            <span class="aimg-status" data-role="status">in progress…</span>
+            <span class="aimg-status" data-role="status">${entry.result ? `finished — ${entry.result.outcome ?? "done"}` : "in progress…"}</span>
         </div>
         <iframe id="${frameId}" class="aimg-frame" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
     `;
-    chatEl.appendChild(wrapper);
-    wrapper.scrollIntoView({ behavior: "smooth", block: "end" });
+    host.appendChild(wrapper);
+    if (entry.result) wrapper.classList.add("aimg-finished");
 
     const iframe = wrapper.querySelector(`#${frameId}`);
-    iframe.srcdoc = wrapGameHtml(html);
+    iframe.srcdoc = wrapGameHtml(entry.html);
+    console.log("[AI Minigames] injected iframe for game", gameId);
+
+    if (entry.result) return; // already finished (re-render case) — no need to re-listen
 
     const listener = (event) => {
         if (!event.data || event.data.__aiMinigame !== true) return;
@@ -129,23 +214,45 @@ function renderGameIntoChat(html) {
 
         window.removeEventListener("message", listener);
         const result = event.data.result || {};
+        entry.result = result;
+
         const statusEl = wrapper.querySelector('[data-role="status"]');
         if (statusEl) statusEl.textContent = `finished — ${result.outcome ?? "done"}`;
         wrapper.classList.add("aimg-finished");
 
-        handleGameResult(result);
+        handleGameResult(result, gameId);
     };
     window.addEventListener("message", listener);
+}
+
+function scanForGameMarkers() {
+    const context = getContext();
+    document.querySelectorAll("#chat .mes").forEach((mesEl) => {
+        const mesId = mesEl.getAttribute("mesid");
+        if (mesId === null) return;
+        const chatEntry = context.chat?.[Number(mesId)];
+        const gameId = chatEntry?.extra?.aimg_game;
+        if (gameId) injectIframeIntoMessage(mesEl, gameId);
+    });
+}
+
+// Watch for #chat re-renders (new messages, swipes, chat load) and re-inject
+// any minigame iframes that got wiped out by them.
+const chatObserverEl = document.getElementById("chat");
+if (chatObserverEl) {
+    const gameObserver = new MutationObserver(() => scanForGameMarkers());
+    gameObserver.observe(chatObserverEl, { childList: true, subtree: true });
 }
 
 // ---------------------------------------------------------------------------
 // Feeding the result back into the roleplay.
 // ---------------------------------------------------------------------------
-async function handleGameResult(result) {
+async function handleGameResult(result, gameId) {
     const settings = getSettings();
     const context = getContext();
 
     const summaryLine = `[Minigame result — outcome: ${result.outcome ?? "unknown"}. ${result.summary ?? ""}]`.trim();
+    console.log("[AI Minigames] game", gameId, "finished:", result);
 
     try {
         if (settings.insertMode === "extension_prompt" && typeof context.setExtensionPrompt === "function") {
@@ -191,28 +298,50 @@ async function requestMinigame(description) {
     saveSettingsDebounced();
 
     if (typeof context.generateQuietPrompt !== "function") {
+        console.error("[AI Minigames] context.generateQuietPrompt is not a function. Available context keys:", Object.keys(context));
         toastr?.error?.("AI Minigames: this ST version doesn't expose generateQuietPrompt — can't request a game.");
         return;
     }
 
+    console.log("[AI Minigames] requesting generation for:", description);
     toastr?.info?.("Asking the AI to build your minigame…");
     let raw;
     try {
-        raw = await context.generateQuietPrompt(GAME_CONTRACT_PROMPT(description), false, false);
+        // Prefer the object-form call — ST logs a deprecation warning for the
+        // old positional (prompt, quietToLoud, skipWIAN) signature and may drop
+        // it entirely in a future version.
+        raw = await context.generateQuietPrompt({
+            quietPrompt: GAME_CONTRACT_PROMPT(description),
+            quietToLoud: false,
+            skipWIAN: true,
+        });
     } catch (e) {
-        console.error("[AI Minigames] generation failed:", e);
+        console.error("[AI Minigames] generation call threw:", e);
         toastr?.error?.("AI Minigames: generation failed. Check console.");
         return;
     }
 
-    const html = extractHtml(raw || "");
+    // generateQuietPrompt's return shape isn't 100% consistent across ST versions —
+    // coerce defensively instead of assuming it's always a plain string.
+    if (raw && typeof raw === "object") {
+        raw = raw.text ?? raw.message ?? raw.content ?? JSON.stringify(raw);
+    }
+    console.log("[AI Minigames] raw response length:", raw?.length ?? 0);
+
+    const html = extractHtml(String(raw ?? ""));
     if (!html) {
-        toastr?.error?.("AI Minigames: the model didn't return usable HTML. Try again or rephrase.");
-        console.warn("[AI Minigames] raw response:", raw);
+        toastr?.error?.("AI Minigames: the model didn't return usable HTML. Try again or rephrase. See console for the raw response.");
+        console.warn("[AI Minigames] extraction failed. Raw response was:", raw);
         return;
     }
 
-    renderGameIntoChat(html);
+    console.log("[AI Minigames] extracted HTML, length:", html.length, "— posting message.");
+    try {
+        await postMinigameMessage(html);
+    } catch (e) {
+        console.error("[AI Minigames] postMinigameMessage threw:", e);
+        toastr?.error?.("AI Minigames: generated the game but failed to post it. Check console.");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +426,13 @@ function tryRegisterSlashCommand() {
                 true,
                 true,
             );
+            console.log("[AI Minigames] /minigame slash command registered.");
+        } else {
+            console.warn("[AI Minigames] context.registerSlashCommand not available — slash command NOT registered. Use the settings-drawer Generate button instead.");
+            toastr?.warning?.("AI Minigames: slash command unavailable in this ST version — use the extension panel's Generate button instead.");
         }
     } catch (e) {
-        console.warn("[AI Minigames] slash command registration skipped:", e);
+        console.warn("[AI Minigames] slash command registration threw:", e);
     }
 }
 
