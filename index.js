@@ -62,15 +62,36 @@ Requirements (all mandatory):
 4. Keep the game simple enough to render and finish in under a couple minutes.
    Clear on-screen instructions. Legible on a dark background — use light text.
 5. Do not use localStorage, sessionStorage, or cookies.
+6. Avoid JS template literals (backtick strings) anywhere in your script — use
+   string concatenation or .join() instead. This is important: your output will
+   be extracted from a fenced code block, and a stray backtick inside your own
+   JS can break that extraction.
 
 Output the HTML now, in a single \`\`\`html code block.
 `.trim();
 
 function extractHtml(text) {
-    const match = text.match(/```html\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
-    if (match) return match[1].trim();
-    // fallback: maybe the model just returned raw HTML with no fence
-    if (text.includes("<html") || text.includes("<!DOCTYPE")) return text.trim();
+    if (!text) return null;
+
+    // Prefer structural extraction (DOCTYPE/<html>...</html>) over fence-matching.
+    // Generated game JS very often contains template literals with backticks
+    // (e.g. `Score: ${score}`), and a naive ``` ... ``` regex closes early on
+    // the first stray backtick sequence inside the code, truncating the game.
+    // This is a known, common failure mode when models wrap HTML/JS in fences
+    // (see e.g. the SillyTavern-WeatherPack extension, whose job is literally
+    // un-mangling HTML/JS that got clipped by backtick fences).
+    const docMatch = text.match(/<!DOCTYPE[\s\S]*?<\/html>/i) || text.match(/<html[\s\S]*?<\/html>/i);
+    if (docMatch) return docMatch[0].trim();
+
+    // Fallback: fence-based extraction, only if there's no </html> to anchor on
+    // (e.g. the model omitted <html> tags entirely and just gave <style>/<script>).
+    const fenced = text.match(/```html\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
+    if (fenced) return fenced[1].trim();
+
+    // Last resort: raw text that looks like markup with no fences at all.
+    if (text.includes("<html") || text.includes("<!DOCTYPE") || text.includes("<style") || text.includes("<script")) {
+        return text.trim();
+    }
     return null;
 }
 
@@ -191,28 +212,43 @@ async function requestMinigame(description) {
     saveSettingsDebounced();
 
     if (typeof context.generateQuietPrompt !== "function") {
+        console.error("[AI Minigames] context.generateQuietPrompt is not a function. Available context keys:", Object.keys(context));
         toastr?.error?.("AI Minigames: this ST version doesn't expose generateQuietPrompt — can't request a game.");
         return;
     }
 
+    console.log("[AI Minigames] requesting generation for:", description);
     toastr?.info?.("Asking the AI to build your minigame…");
     let raw;
     try {
         raw = await context.generateQuietPrompt(GAME_CONTRACT_PROMPT(description), false, false);
     } catch (e) {
-        console.error("[AI Minigames] generation failed:", e);
+        console.error("[AI Minigames] generation call threw:", e);
         toastr?.error?.("AI Minigames: generation failed. Check console.");
         return;
     }
 
-    const html = extractHtml(raw || "");
+    // generateQuietPrompt's return shape isn't 100% consistent across ST versions —
+    // coerce defensively instead of assuming it's always a plain string.
+    if (raw && typeof raw === "object") {
+        raw = raw.text ?? raw.message ?? raw.content ?? JSON.stringify(raw);
+    }
+    console.log("[AI Minigames] raw response length:", raw?.length ?? 0);
+
+    const html = extractHtml(String(raw ?? ""));
     if (!html) {
-        toastr?.error?.("AI Minigames: the model didn't return usable HTML. Try again or rephrase.");
-        console.warn("[AI Minigames] raw response:", raw);
+        toastr?.error?.("AI Minigames: the model didn't return usable HTML. Try again or rephrase. See console for the raw response.");
+        console.warn("[AI Minigames] extraction failed. Raw response was:", raw);
         return;
     }
 
-    renderGameIntoChat(html);
+    console.log("[AI Minigames] extracted HTML, length:", html.length, "— rendering now.");
+    try {
+        renderGameIntoChat(html);
+    } catch (e) {
+        console.error("[AI Minigames] renderGameIntoChat threw:", e);
+        toastr?.error?.("AI Minigames: generated the game but failed to render it. Check console.");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +333,13 @@ function tryRegisterSlashCommand() {
                 true,
                 true,
             );
+            console.log("[AI Minigames] /minigame slash command registered.");
+        } else {
+            console.warn("[AI Minigames] context.registerSlashCommand not available — slash command NOT registered. Use the settings-drawer Generate button instead.");
+            toastr?.warning?.("AI Minigames: slash command unavailable in this ST version — use the extension panel's Generate button instead.");
         }
     } catch (e) {
-        console.warn("[AI Minigames] slash command registration skipped:", e);
+        console.warn("[AI Minigames] slash command registration threw:", e);
     }
 }
 
