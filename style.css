@@ -59,6 +59,25 @@
     opacity: 1;
 }
 
+/* Manual fallback message element — used only when ST's own message
+   rendering never produced a real .mes node for a posted game. Deliberately
+   plain; it exists purely so the game isn't stranded, not to match ST's
+   full message chrome. */
+.aimg-manual-mes {
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px dashed var(--SmartThemeBorderColor, #444);
+    background: var(--SmartThemeBlurTintColor, rgba(20,20,24,0.6));
+}
+
+.aimg-manual-header {
+    font-size: 0.85em;
+    opacity: 0.75;
+    margin-bottom: 6px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
 .aimg-frame {
     width: 100%;
     height: 480px;
