@@ -165,7 +165,12 @@ async function postMinigameMessage(html) {
         is_user: false,
         mes: "🎮 Minigame ready — loading below…",
         send_date: Date.now(),
-        extra: { aimg_game: gameId },
+        // The html lives here too, not just in the in-memory gameStore Map.
+        // gameStore resets to empty on any page reload/extension re-init,
+        // but this object gets saved into the persisted chat JSON — so a
+        // reload can still recover and re-render the game from the message
+        // itself instead of the marker becoming permanently orphaned.
+        extra: { aimg_game: gameId, aimg_html: html },
     };
 
     try {
@@ -179,13 +184,32 @@ async function postMinigameMessage(html) {
     }
 }
 
-function injectIframeIntoMessage(mesEl, gameId) {
+// Games we've already confirmed are unrecoverable (no html anywhere, message
+// re-render or old session) — avoids re-logging the same warning forever on
+// every single #chat mutation/stream token, which otherwise floods console.
+const knownOrphans = new Set();
+
+function injectIframeIntoMessage(mesEl, gameId, chatEntry) {
     if (mesEl.querySelector(`[data-aimg-game="${gameId}"]`)) {
         return; // already injected — this one's fine to stay silent, it's the normal re-render case
     }
-    const entry = gameStore.get(gameId);
+
+    let entry = gameStore.get(gameId);
     if (!entry || !entry.html) {
-        console.warn("[AI Minigames] injectIframeIntoMessage: no stored entry/html for game", gameId, "— gameStore has keys:", Array.from(gameStore.keys()));
+        // Not in the in-memory store (e.g. after a page reload) — try to
+        // recover straight from the message's own persisted extra field.
+        const recoveredHtml = chatEntry?.extra?.aimg_html;
+        if (recoveredHtml) {
+            entry = { html: recoveredHtml, result: chatEntry?.extra?.aimg_result ?? null };
+            gameStore.set(gameId, entry);
+        }
+    }
+
+    if (!entry || !entry.html) {
+        if (!knownOrphans.has(gameId)) {
+            knownOrphans.add(gameId);
+            console.warn("[AI Minigames] no recoverable html for game", gameId, "— this game can't be rendered (not in gameStore or the message's own extra field). Will not retry.");
+        }
         return;
     }
 
@@ -218,6 +242,14 @@ function injectIframeIntoMessage(mesEl, gameId) {
         window.removeEventListener("message", listener);
         const result = event.data.result || {};
         entry.result = result;
+        // Persist the result onto the message's own extra field too, same
+        // reasoning as the html itself — so a reload after the game finishes
+        // still shows it as finished instead of re-offering a dead iframe.
+        if (chatEntry?.extra) {
+            chatEntry.extra.aimg_result = result;
+            const context = getContext();
+            if (typeof context.saveChat === "function") context.saveChat();
+        }
 
         const statusEl = wrapper.querySelector('[data-role="status"]');
         if (statusEl) statusEl.textContent = `finished — ${result.outcome ?? "done"}`;
@@ -242,7 +274,7 @@ function scanForGameMarkers() {
         if (gameId) {
             markedCount += 1;
             found += 1;
-            injectIframeIntoMessage(mesEl, gameId);
+            injectIframeIntoMessage(mesEl, gameId, chatEntry);
         }
     });
     console.log(`[AI Minigames] scanForGameMarkers: scanned ${mesElCount} .mes elements, ${markedCount} carried an aimg_game marker.`);
@@ -373,7 +405,16 @@ function registerMinigameTool() {
                     console.warn("[AI Minigames] tool call html missing a <script> tag — rejecting.");
                     return "Error: html must be a complete document containing a <script> tag with the game logic. Please retry the tool call with valid html.";
                 }
-                await postMinigameMessage(html);
+                // Don't post the message right now — the tool call fires
+                // mid-generation, while ST is still actively streaming and
+                // finalizing the AI's own reply message. Adding a new chat
+                // message via addOneMessage() in that same window collides
+                // with ST's own in-progress DOM update for that message, and
+                // ours silently never lands as a real, rendered message — it
+                // only shows inside the tool-call debug box. Queue it and
+                // post for real once the generation has fully finished.
+                pendingGameHtml.push(html);
+                console.log("[AI Minigames] queued game for posting after generation ends. Queue length:", pendingGameHtml.length);
                 return "Minigame embedded in chat successfully.";
             },
         });
@@ -381,6 +422,21 @@ function registerMinigameTool() {
         console.log("[AI Minigames] submit_minigame function tool registered.");
     } catch (e) {
         console.warn("[AI Minigames] registerFunctionTool threw:", e);
+    }
+}
+
+const pendingGameHtml = [];
+
+async function drainPendingGames() {
+    if (!pendingGameHtml.length) return;
+    console.log("[AI Minigames] generation ended — draining", pendingGameHtml.length, "queued game(s).");
+    while (pendingGameHtml.length) {
+        const html = pendingGameHtml.shift();
+        try {
+            await postMinigameMessage(html);
+        } catch (e) {
+            console.error("[AI Minigames] failed to post a queued game:", e);
+        }
     }
 }
 
@@ -620,6 +676,7 @@ jQuery(() => {
                     context.setExtensionPrompt(TOOL_NUDGE_KEY, "", 1, 0, false);
                 }
             } catch {}
+            drainPendingGames();
         });
 
         console.log("[AI Minigames] loaded.");
